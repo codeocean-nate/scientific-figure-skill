@@ -1,7 +1,8 @@
 ---
 name: scientific-figure
 description: Draw a publication-style scientific illustration (mechanism of action, antibody or ADC binding, receptor engagement, T-cell engagers, cell-cell interactions) as an editable SVG and PNG in the clean look of a BioRender figure. Draws with code, then looks at its own rendering and fixes it, up to three rounds. Use when someone asks to draw, illustrate, sketch or diagram biology, or to "make a figure like BioRender/Phylo". Not for data plots or charts.
-tags: [figures, illustration, schematic, mechanism-of-action, antibody, visualization]
+metadata:
+  tags: [figures, illustration, schematic, mechanism-of-action, antibody, visualization]
 ---
 
 # Scientific figure
