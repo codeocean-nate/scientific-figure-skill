@@ -14,10 +14,15 @@ Quick start
     adc = c.antibody(dock=cd38, arm="right", arms=(TEAL, TEAL), payloads=4)
     c.callout("Anti-CD38 ADC", target=adc.point("hinge"), at=(470, 300))
     c.legend([("igg", "IgG antibody"), ("payload", "Payload on cleavable linker"), ("receptor", "CD38", TEAL)])
-    c.save("figure.svg")   # also writes figure.png and prints layout warnings
+    c.save("figure.svg")   # also writes figure.png, figure@2x.png and prints layout warnings
+
+By default (fit=True) the title, subtitle and legend are placed around the finished drawing and the
+image is trimmed to it, so there is no need to position them or to fill the whole canvas.
+Shapes the kit lacks can be drawn as raw SVG with c.add('<path .../>').
 
 Palette constants: TEXT, MUTED, HEAVY, LIGHT, TEAL, PURPLE, GRAY, GREEN, RED, GOLD, PINK, PAYLOAD.
 """
+import io
 import json
 import math
 import os
@@ -150,19 +155,23 @@ class Antibody:
 
 
 class Canvas:
-    LAYERS = ("back", "cells", "receptors", "molecules", "arrows", "labels")
+    LAYERS = ("back", "cells", "receptors", "molecules", "arrows", "labels", "frame")
 
-    def __init__(self, width=1600, height=1000, title=None, subtitle=None, background="#FFFFFF"):
+    def __init__(self, width=1600, height=1000, title=None, subtitle=None, background="#FFFFFF", fit=True):
+        """fit=True (default): at save time the title, subtitle and legend are placed around the drawing
+        and the image is trimmed to it. fit=False keeps the fixed canvas, with the title at the top and the
+        legend along the bottom."""
         self.w, self.h, self.bg = width, height, background
+        self.fit = fit
         self._layers = {k: [] for k in self.LAYERS}
         self._defs = {}
         self._boxes = []    # estimated text boxes: (x0, y0, x1, y1, text)
+        self._frame = set()  # indexes into _boxes for the title, subtitle and legend
         self._extent = []   # sample points of drawn parts: (x, y, what)
         self._n = 0
-        if title:
-            self.label(title, width / 2, 58, size=30, bold=True)
-        if subtitle:
-            self.label(subtitle, width / 2, 94, size=19, color=MUTED)
+        self._title, self._subtitle = title, subtitle
+        self._legend_req = None
+        self._viewbox = (0, 0, width, height)
 
     # ---------- internals ----------
     def _id(self, prefix):
@@ -171,6 +180,11 @@ class Canvas:
 
     def _add(self, layer, s):
         self._layers[layer].append(s)
+
+    def add(self, svg, layer="molecules"):
+        """Add raw SVG (paths, shapes, text) for anything the kit has no part for. Layers, back to
+        front: back, cells, receptors, molecules, arrows, labels."""
+        self._add(layer, svg)
 
     def _track(self, x, y, what):
         self._extent.append((x, y, what))
@@ -195,7 +209,7 @@ class Canvas:
 
     # ---------- text ----------
     def label(self, text, x, y, size=18, bold=False, italic=False, color=TEXT, anchor="middle",
-              line_height=1.25, halo=False):
+              line_height=1.25, halo=False, layer="labels"):
         """Text at (x, y); y is the baseline of the first line. Use '\\n' for line breaks.
         anchor: 'start' | 'middle' | 'end'. halo=True adds a white outline for text over shapes."""
         lines = str(text).split("\n")
@@ -207,14 +221,16 @@ class Canvas:
         common = (f'x="{_f(x)}" y="{_f(y)}" font-size="{size}" font-weight="{weight}"{style} '
                   f'text-anchor="{anchor}"')
         if halo:
-            self._add("labels", f'<text {common} fill="none" stroke="#FFFFFF" stroke-width="5" '
-                                f'stroke-linejoin="round">{spans}</text>')
-        self._add("labels", f'<text {common} fill="{color}">{spans}</text>')
+            self._add(layer, f'<text {common} fill="none" stroke="#FFFFFF" stroke-width="5" '
+                             f'stroke-linejoin="round">{spans}</text>')
+        self._add(layer, f'<text {common} fill="{color}">{spans}</text>')
         wmax = max(self._text_width(t, size, bold) for t in lines)
         x0 = {"start": x, "middle": x - wmax / 2, "end": x - wmax}[anchor]
         top = y - size * 0.8
         bottom = y + size * line_height * (len(lines) - 1) + size * 0.25
         self._boxes.append((x0, top, x0 + wmax, bottom, lines[0]))
+        if layer == "frame":
+            self._frame.add(len(self._boxes) - 1)
         return (x0, top, x0 + wmax, bottom)
 
     def callout(self, text, target, at, size=17, bold=False, color=TEXT, anchor=None, line_color="#2B2F3A",
@@ -477,14 +493,24 @@ class Canvas:
         self._add("molecules", "".join(out))
 
     def legend(self, items, y=None, margin=40, size=15, title=None):
-        """A legend box along the bottom. items: (kind, text) or (kind, text, color) with kind one of
-        igg, adc, payload, receptor, scfv, granule, t_cell, tumor. Wraps to more rows as needed."""
+        """A legend box. items: (kind, text) or (kind, text, color) with kind one of igg, adc, payload,
+        receptor, scfv, granule, t_cell, tumor. Wraps to more rows as needed. With fit=True and no y it
+        is placed under the finished drawing at save time; otherwise it runs along the bottom (or at y)."""
+        for it in items:
+            self._legend_icon(it[0], 0, 0, it[2] if len(it) > 2 else None)   # fail early on a bad kind
+        if y is None and self.fit:
+            self._legend_req = dict(items=items, margin=margin, size=size, title=title)
+            return None
+        return self._legend_draw(items, margin, self.w - 2 * margin, self.h - margin if y is None else None,
+                                 y, size, title, "labels")
+
+    def _legend_draw(self, items, x_left, box_w, bottom, top, size, title, layer, shrink=False):
         icon_w, pad, gap = 58, 18, 26
         widths = []
         for it in items:
             lines = it[1].split("\n")
             widths.append(icon_w + 8 + max(self._text_width(t, size, False) for t in lines))
-        avail = self.w - 2 * margin - 2 * pad
+        avail = box_w - 2 * pad
         rows, row, used = [], [], 0
         for i, wd in enumerate(widths):
             if row and used + gap + wd > avail:
@@ -496,15 +522,20 @@ class Canvas:
             rows.append(row)
         row_h = 62
         box_h = pad * 2 + row_h * len(rows) + (26 if title else 0)
-        y0 = self.h - margin - box_h if y is None else y
-        out = [f'<rect x="{margin}" y="{_f(y0)}" width="{self.w - 2 * margin}" height="{_f(box_h)}" rx="10" '
+        if shrink:   # box hugs its widest row, centered where it was
+            widest = max(sum(widths[i] for i in r) + gap * (len(r) - 1) for r in rows)
+            if title:
+                widest = max(widest, self._text_width(title, size + 1, True))
+            x_left, box_w, avail = x_left + (box_w - widest - 2 * pad) / 2, widest + 2 * pad, widest
+        y0 = top if top is not None else bottom - box_h
+        out = [f'<rect x="{_f(x_left)}" y="{_f(y0)}" width="{_f(box_w)}" height="{_f(box_h)}" rx="10" '
                f'fill="#FFFFFF" stroke="#C9CDD6" stroke-width="1.4"/>']
         if title:
-            out.append(f'<text x="{margin + pad}" y="{_f(y0 + pad + 14)}" font-size="{size + 1}" font-weight="700" '
-                       f'fill="{TEXT}">{_esc(title)}</text>')
+            out.append(f'<text x="{_f(x_left + pad)}" y="{_f(y0 + pad + 14)}" font-size="{size + 1}" '
+                       f'font-weight="700" fill="{TEXT}">{_esc(title)}</text>')
         for r_i, row in enumerate(rows):
             total = sum(widths[i] for i in row) + gap * (len(row) - 1)
-            x = margin + pad + (avail - total) / 2
+            x = x_left + pad + (avail - total) / 2
             cy = y0 + pad + (26 if title else 0) + row_h * r_i + row_h / 2
             for i in row:
                 kind, text = items[i][0], items[i][1]
@@ -516,9 +547,11 @@ class Canvas:
                                 f'{_esc(t)}</tspan>' for k, t in enumerate(lines))
                 out.append(f'<text x="{_f(x + icon_w + 8)}" y="{_f(ty)}" font-size="{size}" fill="{TEXT}">{spans}</text>')
                 x += widths[i] + gap
-        self._add("labels", "".join(out))
-        self._boxes.append((margin, y0, self.w - margin, y0 + box_h, "<legend>"))
-        return (margin, y0, self.w - margin, y0 + box_h)
+        self._add(layer, "".join(out))
+        self._boxes.append((x_left, y0, x_left + box_w, y0 + box_h, "<legend>"))
+        if layer == "frame":
+            self._frame.add(len(self._boxes) - 1)
+        return (x_left, y0, x_left + box_w, y0 + box_h)
 
     def _legend_icon(self, kind, x, y, color):
         if kind in ("igg", "adc"):
@@ -553,7 +586,9 @@ class Canvas:
         for x, y, what in self._extent:
             if x < margin or y < margin or x > self.w - margin or y > self.h - margin:
                 warns.append(f"{what.strip()} at ({x:.0f}, {y:.0f}) is outside the canvas")
-        for x0, y0, x1, y1, t in self._boxes:
+        for k, (x0, y0, x1, y1, t) in enumerate(self._boxes):
+            if k in self._frame and self._viewbox != (0, 0, self.w, self.h):
+                continue
             if x0 < margin or y0 < margin or x1 > self.w - margin or y1 > self.h - margin:
                 warns.append(f"text '{t}' runs off the canvas (box {x0:.0f},{y0:.0f}-{x1:.0f},{y1:.0f})")
         b = self._boxes
@@ -569,18 +604,72 @@ class Canvas:
                     warns.append(f"text '{t}' covers {what.strip()}")
         return sorted(set(warns))
 
-    def svg(self):
-        head = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{self.w}" height="{self.h}" '
-                f'viewBox="0 0 {self.w} {self.h}" font-family="{FONT}">')
+    def svg(self, frame=True, viewbox=None):
+        vx, vy, vw, vh = viewbox or self._viewbox
+        head = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{_f(vw)}" height="{_f(vh)}" '
+                f'viewBox="{_f(vx)} {_f(vy)} {_f(vw)} {_f(vh)}" font-family="{FONT}">')
         body = [f'<defs>{"".join(self._defs.values())}</defs>',
-                f'<rect width="{self.w}" height="{self.h}" fill="{self.bg}"/>']
+                f'<rect x="{_f(vx)}" y="{_f(vy)}" width="{_f(vw)}" height="{_f(vh)}" fill="{self.bg}"/>']
         for layer in self.LAYERS:
+            if layer == "frame" and not frame:
+                continue
             body.append(f'<g id="{layer}">{"".join(self._layers[layer])}</g>')
         return head + "".join(body) + "</svg>"
 
+    def _content_bbox(self):
+        """Pixel bounds of everything drawn so far except the title, subtitle and legend, or None."""
+        try:
+            import cairosvg
+            from PIL import Image, ImageChops
+        except ImportError:
+            return None
+        png = cairosvg.svg2png(bytestring=self.svg(frame=False, viewbox=(0, 0, self.w, self.h)).encode("utf-8"),
+                               output_width=self.w)
+        im = Image.open(io.BytesIO(png)).convert("RGB")
+        diff = ImageChops.difference(im, Image.new("RGB", im.size, self.bg)).convert("L")
+        return diff.point(lambda v: 255 if v > 10 else 0).getbbox()
+
+    def _place_frame(self, bbox):
+        """Draw title, subtitle and legend around bbox (or the fixed canvas when bbox is None) and set
+        the view box."""
+        if bbox is None:
+            if self._title:
+                self.label(self._title, self.w / 2, 58, size=30, bold=True, layer="frame")
+            if self._subtitle:
+                self.label(self._subtitle, self.w / 2, 94, size=19, color=MUTED, layer="frame")
+            if self._legend_req:
+                r = self._legend_req
+                self._legend_draw(r["items"], r["margin"], self.w - 2 * r["margin"], self.h - r["margin"], None,
+                                  r["size"], r["title"], "frame")
+            self._viewbox = (0, 0, self.w, self.h)
+            return
+        x0, y0, x1, y1 = bbox
+        cx = (x0 + x1) / 2
+        boxes = [(x0, y0, x1, y1)]
+        yt = y0 - 40 - (34 if self._subtitle else 0)
+        if self._title:
+            boxes.append(self.label(self._title, cx, yt, size=30, bold=True, layer="frame"))
+        if self._subtitle:
+            boxes.append(self.label(self._subtitle, cx, yt + 34 if self._title else y0 - 40, size=19,
+                                    color=MUTED, layer="frame"))
+        if self._legend_req:
+            r = self._legend_req
+            width = max(x1 - x0, 900)
+            boxes.append(self._legend_draw(r["items"], cx - width / 2, width, None, y1 + 36, r["size"],
+                                           r["title"], "frame", shrink=True))
+        pad = 36
+        vx0 = min(b[0] for b in boxes) - pad
+        vy0 = min(b[1] for b in boxes) - pad
+        vx1 = max(b[2] for b in boxes) + pad
+        vy1 = max(b[3] for b in boxes) + pad
+        self._viewbox = (vx0, vy0, vx1 - vx0, vy1 - vy0)
+
     def save(self, path, png=True):
-        """Write the SVG, a PNG next to it (when a renderer is available) and <name>.warnings.json.
-        Prints the layout warnings."""
+        """Write the SVG, figure PNGs next to it (1x and @2x, when a renderer is available) and
+        <name>.warnings.json. Prints the layout warnings. With fit=True the title, subtitle and legend
+        are placed around the drawing here and the image is trimmed to it."""
+        if not any(k in self._frame for k in range(len(self._boxes))):   # place the frame once
+            self._place_frame(self._content_bbox() if self.fit else None)
         svg = self.svg()
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(svg)
@@ -591,7 +680,9 @@ class Canvas:
         for w in warns:
             print("WARNING:", w)
         if png:
-            render_png(path, base + ".png", self.w)
+            vw = round(self._viewbox[2])
+            render_png(path, base + ".png", vw)
+            render_png(path, base + "@2x.png", 2 * vw)
         return warns
 
 
